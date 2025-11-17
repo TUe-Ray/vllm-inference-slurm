@@ -1,0 +1,78 @@
+#!/bin/bash
+#SBATCH --job-name=vllm_chat
+#SBATCH --partition=gpu_a100 # or gpu_h100
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --gpus-per-node=1   # 1-4 GPUs per node
+#SBATCH --time=02:00:00
+
+set -euo pipefail
+
+echo "Node: ${HOSTNAME}"
+echo "GPUs on node: ${SLURM_GPUS_ON_NODE:-1}"
+
+# -------- 基本路徑設定 --------
+CONTAINER_PATH=/projects/2/managed_datasets/containers/vllm/vllm_25.09.sif
+PROJECT_SPACE=            # 如果你有 /projects/… 就填，沒有就留空
+
+DOWNLOAD_DIR=/scratch-shared/$USER/vllm/
+export HF_HOME=$DOWNLOAD_DIR
+mkdir -p "$DOWNLOAD_DIR"
+
+# 換成你要的 Qwen 模型
+MODEL_CHECKPOINT="Qwen/Qwen2.5-7B-Instruct"
+
+PORT=8000
+MAX_TOKENS=256
+MAX_CONCURRENT=64
+
+VLLM_BASE_URL=http://localhost:$PORT/v1
+
+# 綁定目錄：至少要有 scratch-shared，若有 project space 就加進來
+BIND_DIRS="/scratch-shared/$USER"
+if [ -n "$PROJECT_SPACE" ]; then
+  BIND_DIRS="$BIND_DIRS,$PROJECT_SPACE"
+fi
+
+echo "Using container: $CONTAINER_PATH"
+echo "Model: $MODEL_CHECKPOINT"
+echo "Bind dirs: $BIND_DIRS"
+echo "HF cache: $DOWNLOAD_DIR"
+echo "Port: $PORT"
+
+# -------- 啟動 vLLM server --------
+apptainer exec --nv \
+  -B "${BIND_DIRS}" \
+  "${CONTAINER_PATH}" \
+  vllm serve "$MODEL_CHECKPOINT" \
+  --tensor-parallel-size "${SLURM_GPUS_ON_NODE:-1}" \
+  --download-dir "$DOWNLOAD_DIR" \
+  --uvicorn-log-level warning \
+  --port "$PORT" \
+  --max-model-len "$MAX_TOKENS" \
+  --max-concurrent-requests "$MAX_CONCURRENT" &
+
+VLLM_PID=$!
+echo "vLLM PID: $VLLM_PID"
+
+# -------- 健康檢查：等他 ready --------
+echo "Waiting for vLLM server to be ready..."
+MAX_WAIT=600
+ELAPSED=0
+while ! curl -s "http://localhost:$PORT/health" > /dev/null; do
+    sleep 5
+    ELAPSED=$((ELAPSED + 5))
+    if [ ${ELAPSED} -ge ${MAX_WAIT} ]; then
+        echo "Error: vLLM server failed to start within ${MAX_WAIT} seconds"
+        kill ${VLLM_PID} 2>/dev/null || true
+        exit 1
+    fi
+    echo "Waiting... ${ELAPSED}s"
+done
+
+echo "✅ vLLM server is ready at $VLLM_BASE_URL"
+echo "保持這個 job 跑著，你可以在同一個節點上用 client 連線聊天。"
+
+# -------- 讓 job 跟著 server 一起活著 --------
+wait ${VLLM_PID}
+echo "vLLM server stopped."
