@@ -1,0 +1,48 @@
+#!/bin/bash
+#SBATCH --job-name=vllm_minimal
+#SBATCH --partition=gpu_a100
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --gpus-per-node=1
+#SBATCH --time=02:00:00
+
+set -euo pipefail
+
+echo "Hostname: $(hostname)"
+echo "GPUs on node: ${SLURM_GPUS_ON_NODE:-1}"
+
+#--- 基本設定 ---
+CONTAINER_PATH=/projects/2/managed_datasets/containers/vllm/vllm_25.09.sif
+
+PROJECT_SPACE=
+DOWNLOAD_DIR=/scratch-shared/$USER/vllm/
+export HF_HOME=$DOWNLOAD_DIR
+mkdir -p "$DOWNLOAD_DIR"
+
+MODEL_CHECKPOINT="Qwen/Qwen2.5-7B-Instruct"
+PORT=8000
+MAX_TOKENS=4096
+
+BIND_DIRS="/scratch-shared/$USER"
+if [ -n "$PROJECT_SPACE" ]; then
+  BIND_DIRS="$BIND_DIRS,$PROJECT_SPACE"
+fi
+
+echo "Container: $CONTAINER_PATH"
+echo "Model: $MODEL_CHECKPOINT"
+echo "Bind dirs: $BIND_DIRS"
+echo "HF cache: $DOWNLOAD_DIR"
+echo "Port: $PORT"
+
+module load apptainer || true
+
+echo "=== 即將啟動 vllm serve（前景模式）==="
+apptainer exec --nv \
+  -B "${BIND_DIRS}" \
+  "${CONTAINER_PATH}" \
+  vllm serve "$MODEL_CHECKPOINT" \
+    --tensor-parallel-size "${SLURM_GPUS_ON_NODE:-1}" \
+    --download-dir "$DOWNLOAD_DIR" \
+    --uvicorn-log-level info \
+    --port "$PORT" \
+    --max-model-len "$MAX_TOKENS"
